@@ -25,7 +25,7 @@
  */
 import { execFile } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, statfsSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statfsSync, writeFileSync } from 'node:fs'
 import { homedir, cpus as osCpus, loadavg } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createServer } from 'node:net'
@@ -176,6 +176,10 @@ export function resolveImage(ref: string): string {
   const trimmed = ref.trim()
   if (trimmed.length === 0) throw new PodmanSbError('image reference is empty')
   if (/\s/u.test(trimmed)) throw new PodmanSbError(`image reference has whitespace: ${trimmed}`)
+  // Flag-shaped refs must never reach a podman argv option position (audit run-1).
+  if (trimmed.startsWith('-') || !/^[A-Za-z0-9][A-Za-z0-9._:/@+-]*$/u.test(trimmed)) {
+    throw new PodmanSbError(`image reference "${trimmed}" is not a valid reference (flag-shaped or bad charset)`)
+  }
   const alias = CATALOG[trimmed.toLowerCase()]
   if (alias !== undefined) return alias.image
   // A usable ref names a registry (`ghcr.io/x/y`) or a library image (`debian:tag`).
@@ -288,13 +292,29 @@ export function timerUnitBase(container: string): string {
  * @param cwd - the current workspace root.
  * @returns the resolved absolute path, or null when rejected.
  */
+/** Credential subtrees never mount into a sandbox the model controls. */
+const DENIED_SUBTREES = ['.ssh', '.gnupg', '.aws', '.kube', '.docker', '.config/gh', '.config/podman']
+
 export function safeMount(hostPath: string, home: string, cwd: string): string | null {
-  const resolved = resolve(hostPath)
-  const homeRoot = resolve(home)
+  const homeRoot = realpathSync(home)
+  // The workspace root only widens the allowance while it sits inside $HOME.
   const cwdRoot = resolve(cwd)
-  if (resolved === homeRoot || resolved.startsWith(homeRoot + '/')) return resolved
-  if (resolved === cwdRoot || resolved.startsWith(cwdRoot + '/')) return resolved
-  return null
+  const allowedRoots = [homeRoot]
+  if (cwdRoot === homeRoot || cwdRoot.startsWith(homeRoot + '/')) allowedRoots.push(realpathSync(cwdRoot))
+  // Lexical resolve first, then the kernel's view: a symlink inside an allowed
+  // root must not smuggle a target outside it (audit run-1).
+  let real: string
+  try {
+    real = realpathSync(resolve(hostPath))
+  } catch {
+    return null
+  }
+  const underAllowed = allowedRoots.some((root) => real === root || real.startsWith(root + '/'))
+  if (!underAllowed) return null
+  if (real === homeRoot) return null
+  const relative = real.startsWith(homeRoot + '/') ? real.slice(homeRoot.length + 1) : ''
+  if (DENIED_SUBTREES.some((denied) => relative === denied || relative.startsWith(denied + '/'))) return null
+  return real
 }
 
 /**
@@ -333,6 +353,30 @@ export function normalizePublish(spec: string, fallbackHostPort: number): string
     return null
   }
   return portSpec(host, ctr)
+}
+
+/**
+ * Parse and confine a CONTAINER:/path spec (podman_cp). The embedded name runs
+ * through the same prefix rule as every other tool; foreign containers are
+ * rejected (audit run-1).
+ * @param spec - `box:/tmp/x` or `dsh-sb-box:/tmp/x`.
+ * @returns the normalized `{ name, path }`, or null when the spec is foreign
+ * or malformed.
+ */
+export function parseContainerSpec(spec: string): { name: string; path: string } | null {
+  const colon = spec.indexOf(':')
+  if (colon === -1) return null
+  const rawName = spec.slice(0, colon)
+  const path = spec.slice(colon + 1)
+  if (path.length === 0 || !path.startsWith('/')) return null
+  if (rawName.startsWith('-')) return null
+  let name: string
+  try {
+    name = normalizeContainer(rawName)
+  } catch {
+    return null
+  }
+  return { name, path }
 }
 
 /** Run arguments the plugin may set — the full, validated shape. */
@@ -381,19 +425,32 @@ export function buildRunArgs(spec: RunSpec, home: string = homedir(), cwd: strin
     args.push(`--env=${key}=${value}`)
   }
   for (const mount of spec.mounts ?? []) {
-    const [host, ...rest] = mount.split(':')
-    const containerSide = rest.join(':')
-    if (containerSide.length === 0) throw new PodmanSbError(`mount "${mount}" needs HOST:CTR form`)
+    const firstColon = mount.indexOf(':')
+    if (firstColon === -1) throw new PodmanSbError(`mount "${mount}" needs HOST:CTR form`)
+    const host = mount.slice(0, firstColon)
+    let containerSide = mount.slice(firstColon + 1)
+    // Only 'ro' may follow a second colon; anything else is a bind option
+    // smuggle (:U host chown, :Z relabel — audit run-1).
+    const secondColon = containerSide.indexOf(':')
+    if (secondColon !== -1) {
+      const option = containerSide.slice(secondColon + 1)
+      if (option !== 'ro') throw new PodmanSbError(`mount "${mount}" may only add the 'ro' option`)
+      containerSide = containerSide.slice(0, secondColon)
+    }
+    if (!/^\/[A-Za-z0-9._/-]*$/u.test(containerSide)) {
+      throw new PodmanSbError(`mount "${mount}" container side must be a plain absolute path`)
+    }
     const approved = safeMount(host, home, cwd)
     if (approved === null) {
       throw new PodmanSbError(
-        `mount host path "${host}" must live under ${home} or ${cwd} (rootless-safe)`,
+        `mount host path "${host}" must live under ${home} or ${cwd}, outside credential subtrees (rootless-safe)`,
       )
     }
-    args.push(`--volume=${approved}:${containerSide}`)
+    args.push(`--volume=${approved}:${containerSide}${secondColon !== -1 ? ':ro' : ''}`)
   }
   for (const publish of spec.ports ?? []) args.push(`--publish=${publish}`)
-  args.push(spec.image, 'sleep', 'infinity')
+  // '--' so the image operand can never be option-parsed (audit run-1).
+  args.push('--', spec.image, 'sleep', 'infinity')
   return args
 }
 
@@ -1095,17 +1152,21 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (spec.to_container) {
         const approved = safeMount(spec.src, home, cwd)
         if (approved === null) {
-          throw new PodmanSbError(`host source "${spec.src}" must live under ${home} or ${cwd}`)
+          throw new PodmanSbError(`host source "${spec.src}" must live under ${home} or ${cwd}, outside credential subtrees`)
         }
-        if (!spec.dst.includes(':')) throw new PodmanSbError('destination needs CONTAINER:/path form')
-        argv = ['cp', approved, spec.dst]
+        const target = parseContainerSpec(spec.dst)
+        if (target === null) throw new PodmanSbError('destination needs a managed CONTAINER:/abs/path form')
+        if (target.name !== container) throw new PodmanSbError(`destination names container "${target.name}", not "${container}"`)
+        argv = ['cp', approved, `${target.name}:${target.path}`]
       } else {
-        if (!spec.src.includes(':')) throw new PodmanSbError('source needs CONTAINER:/path form')
+        const source = parseContainerSpec(spec.src)
+        if (source === null) throw new PodmanSbError('source needs a managed CONTAINER:/abs/path form')
+        if (source.name !== container) throw new PodmanSbError(`source names container "${source.name}", not "${container}"`)
         const approved = safeMount(spec.dst, home, cwd)
         if (approved === null) {
-          throw new PodmanSbError(`host destination "${spec.dst}" must live under ${home} or ${cwd}`)
+          throw new PodmanSbError(`host destination "${spec.dst}" must live under ${home} or ${cwd}, outside credential subtrees`)
         }
-        argv = ['cp', spec.src, approved]
+        argv = ['cp', `${source.name}:${source.path}`, approved]
       }
       const { stdout } = await podman(options, argv, exec.signal, 300_000)
       return { container, copied: `${spec.src} → ${spec.dst}`, output: stdout.trim(), text: 'copied' }
