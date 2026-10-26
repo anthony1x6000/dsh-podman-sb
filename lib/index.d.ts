@@ -38,6 +38,12 @@ export interface Config {
     warmPull?: boolean;
     /** State dir holding the TTL ledger. Default `~/.local/share/dsh-podman-sb`. */
     dataDir?: string;
+    /** Max concurrent managed sandboxes. Default 8 (audit run-1: unbounded creates). */
+    maxContainers?: number;
+    /** Default CPU limit applied when the agent sets none. Default 2. */
+    defaultCpus?: number;
+    /** Default memory limit (MB) applied when the agent sets none. Default 2048. */
+    defaultMemoryMb?: number;
 }
 /** Resolved options the runtime helpers use. */
 export interface Options {
@@ -45,6 +51,9 @@ export interface Options {
     defaultTtlMinutes: number;
     warmPull: boolean;
     dataDir: string;
+    maxContainers: number;
+    defaultCpus: number;
+    defaultMemoryMb: number;
 }
 /** Project config onto fully-defaulted options. */
 export declare function resolveConfig(config?: Config): Options;
@@ -96,6 +105,44 @@ export declare function remainingMs(expiresAt: number, now: number): number;
  */
 export declare function ttlText(ms: number): string;
 /**
+ * podman emits `Names` as an array since v4; docker-style output uses a
+ * scalar. Both normalize to one usable name or undefined (audit run-1:
+ * a shape mismatch silently disabled the whole sweep layer).
+ * @param names - the raw `Names` value of a `podman ps --format json` row.
+ * @returns the first name when the shape is usable.
+ */
+export declare function normalizePsName(names: unknown): string | undefined;
+/**
+ * Parse a label number: non-numeric or non-finite values fall back to 0 so
+ * NaN can never slip past a comparison guard (audit run-1).
+ */
+export declare function labelNumber(value: string | undefined): number;
+/**
+ * True when a ps row carries this install's ownership token. The prefix and
+ * the managed label are forgeable by any same-user podman process; the token
+ * file under the plugin data dir is not on that path (audit run-1).
+ */
+export declare function ownsRow(labels: Record<string, string>, token: string): boolean;
+/** Drop ledger entries whose container cannot exist anymore (audit run-1). */
+export declare function pruneLedger(state: StateLedger, now: number): StateLedger;
+/**
+ * Deterministic resource ceiling for one container: defaults fill omissions,
+ * host facts bound the ask (audit run-1: unbounded provisioning).
+ * @param request - agent-supplied cpus/memoryMb (optional).
+ * @param hostCpus - host cpu count.
+ * @param memAvailableBytes - host available memory.
+ * @returns the clamped per-container limits.
+ */
+export declare function clampResources(request: {
+    cpus?: number;
+    memoryMb?: number;
+}, hostCpus: number, memAvailableBytes: number): {
+    cpus: number;
+    memoryMb: number;
+};
+/** Head/tail cap for tool-returned command output (audit run-1). */
+export declare function truncateIo(text: string, head?: number, tail?: number): string;
+/**
  * Systemd unit base for one container's kill timer. `systemd-run --unit`
  * appends `.timer`/`.service`; characters outside systemd's safe set become `-`.
  * @param container - full container name.
@@ -137,6 +184,8 @@ export interface RunSpec {
     expiresAt: number;
     createdAt: number;
     desktop: boolean;
+    /** Install ownership token; foreign containers without it are ignored. */
+    token: string;
     cpus?: number;
     memoryMb?: number;
     env?: Record<string, string>;
@@ -209,9 +258,18 @@ export interface HostSnapshot {
     diskPath: string;
     text: string;
 }
+/** TTL ledger entries surviving crashes; label is the fallback source. */
+interface StateLedger {
+    containers: Record<string, {
+        createdAt: number;
+        expiresAt: number;
+        memoryMb?: number;
+    }>;
+}
 /**
  * Register the podman sandbox tools and the prompt section.
  * @param ctx - plugin context with `ctx.tools` and `ctx.systemPrompt`.
  * @param config - optional defaults from the patch row.
  */
 export declare function apply(ctx: Context, config?: Config): void;
+export {};

@@ -24,8 +24,8 @@
  * @module dsh-podman-sb
  */
 import { execFile } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statfsSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statfsSync, writeFileSync } from 'node:fs'
 import { homedir, cpus as osCpus, loadavg } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createServer } from 'node:net'
@@ -53,6 +53,7 @@ const LABEL = {
   desktop: 'dsh-podman-sb.desktop',
   vncPort: 'dsh-podman-sb.vnc-port',
   novncPort: 'dsh-podman-sb.novnc-port',
+  token: 'dsh-podman-sb.token',
 } as const
 
 /** Default container lifetime when the agent sets none. */
@@ -131,6 +132,12 @@ export interface Config {
   warmPull?: boolean
   /** State dir holding the TTL ledger. Default `~/.local/share/dsh-podman-sb`. */
   dataDir?: string
+  /** Max concurrent managed sandboxes. Default 8 (audit run-1: unbounded creates). */
+  maxContainers?: number
+  /** Default CPU limit applied when the agent sets none. Default 2. */
+  defaultCpus?: number
+  /** Default memory limit (MB) applied when the agent sets none. Default 2048. */
+  defaultMemoryMb?: number
 }
 
 /** Resolved options the runtime helpers use. */
@@ -139,6 +146,9 @@ export interface Options {
   defaultTtlMinutes: number
   warmPull: boolean
   dataDir: string
+  maxContainers: number
+  defaultCpus: number
+  defaultMemoryMb: number
 }
 
 /** Project config onto fully-defaulted options. */
@@ -151,6 +161,9 @@ export function resolveConfig(config: Config = {}): Options {
       : DEFAULT_TTL_MINUTES,
     warmPull: config.warmPull ?? true,
     dataDir: config.dataDir ?? join(homedir(), '.local/share/dsh-podman-sb'),
+    maxContainers: Math.max(1, Math.floor(config.maxContainers ?? 8)),
+    defaultCpus: Math.max(1, config.defaultCpus ?? 2),
+    defaultMemoryMb: Math.max(256, Math.floor(config.defaultMemoryMb ?? 2048)),
   }
 }
 
@@ -273,6 +286,86 @@ export function ttlText(ms: number): string {
 }
 
 /**
+ * podman emits `Names` as an array since v4; docker-style output uses a
+ * scalar. Both normalize to one usable name or undefined (audit run-1:
+ * a shape mismatch silently disabled the whole sweep layer).
+ * @param names - the raw `Names` value of a `podman ps --format json` row.
+ * @returns the first name when the shape is usable.
+ */
+export function normalizePsName(names: unknown): string | undefined {
+  if (typeof names === 'string') return names.length > 0 ? names : undefined
+  if (Array.isArray(names) && names.length > 0 && typeof names[0] === 'string') return names[0]
+  return undefined
+}
+
+/**
+ * Parse a label number: non-numeric or non-finite values fall back to 0 so
+ * NaN can never slip past a comparison guard (audit run-1).
+ */
+export function labelNumber(value: string | undefined): number {
+  const parsed = Number(value ?? 0)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+}
+
+/**
+ * True when a ps row carries this install's ownership token. The prefix and
+ * the managed label are forgeable by any same-user podman process; the token
+ * file under the plugin data dir is not on that path (audit run-1).
+ */
+export function ownsRow(labels: Record<string, string>, token: string): boolean {
+  return labels[LABEL.token] === token
+}
+
+/** Drop ledger entries whose container cannot exist anymore (audit run-1). */
+export function pruneLedger(state: StateLedger, now: number): StateLedger {
+  const graceMs = 3_600_000
+  const containers: StateLedger['containers'] = {}
+  for (const [name, entry] of Object.entries(state.containers)) {
+    if (Number.isFinite(entry.createdAt) && entry.createdAt + MAX_TTL_MINUTES * 60_000 + graceMs < now) continue
+    containers[name] = entry
+  }
+  return { containers }
+}
+
+/** Sum of memory the install's live sandboxes claim (ledger source of truth). */
+function committedMemoryMb(state: StateLedger, liveNames: ReadonlySet<string>): number {
+  let total = 0
+  for (const [name, entry] of Object.entries(state.containers)) {
+    if (liveNames.has(name) && Number.isFinite(entry.memoryMb)) total += entry.memoryMb ?? 0
+  }
+  return total
+}
+
+/**
+ * Deterministic resource ceiling for one container: defaults fill omissions,
+ * host facts bound the ask (audit run-1: unbounded provisioning).
+ * @param request - agent-supplied cpus/memoryMb (optional).
+ * @param hostCpus - host cpu count.
+ * @param memAvailableBytes - host available memory.
+ * @returns the clamped per-container limits.
+ */
+export function clampResources(
+  request: { cpus?: number; memoryMb?: number },
+  hostCpus: number,
+  memAvailableBytes: number,
+): { cpus: number; memoryMb: number } {
+  const MiB = 1024 * 1024
+  const maxMemoryMb = Math.max(256, Math.floor(Math.min(8192 * MiB, memAvailableBytes / 2) / MiB))
+  const cpus = Math.min(
+    Math.max(1, Math.floor(request.cpus ?? 2)),
+    Math.max(1, Math.floor(hostCpus)),
+  )
+  const memoryMb = Math.min(Math.max(256, Math.floor(request.memoryMb ?? 2048)), maxMemoryMb)
+  return { cpus, memoryMb }
+}
+
+/** Head/tail cap for tool-returned command output (audit run-1). */
+export function truncateIo(text: string, head = 4096, tail = 1024): string {
+  if (text.length <= head + tail + 64) return text
+  return `${text.slice(0, head)}\n…truncated ${text.length - head - tail} bytes…\n${text.slice(text.length - tail)}`
+}
+
+/**
  * Systemd unit base for one container's kill timer. `systemd-run --unit`
  * appends `.timer`/`.service`; characters outside systemd's safe set become `-`.
  * @param container - full container name.
@@ -280,7 +373,9 @@ export function ttlText(ms: number): string {
  */
 export function timerUnitBase(container: string): string {
   const safe = container.replace(/[^A-Za-z0-9_.:-]/gu, '-')
-  return `dsh-sb-kill-${safe.length > 0 ? safe.slice(0, 180) : 'x'}`
+  // Name hash keeps units injective even for foreign >180-char names (audit run-1).
+  const hash = createHash('sha256').update(container).digest('hex').slice(0, 8)
+  return `dsh-sb-kill-${safe.length > 0 ? safe.slice(0, 180) : 'x'}-${hash}`
 }
 
 /**
@@ -386,6 +481,8 @@ export interface RunSpec {
   expiresAt: number
   createdAt: number
   desktop: boolean
+  /** Install ownership token; foreign containers without it are ignored. */
+  token: string
   cpus?: number
   memoryMb?: number
   env?: Record<string, string>
@@ -412,6 +509,7 @@ export function buildRunArgs(spec: RunSpec, home: string = homedir(), cwd: strin
     [LABEL.createdAt, String(spec.createdAt)],
     [LABEL.expiresAt, String(spec.expiresAt)],
     [LABEL.desktop, spec.desktop ? '1' : '0'],
+    [LABEL.token, spec.token],
   ]
   if (spec.vncHostPort !== undefined) labels.push([LABEL.vncPort, String(spec.vncHostPort)])
   if (spec.novncHostPort !== undefined) labels.push([LABEL.novncPort, String(spec.novncHostPort)])
@@ -670,7 +768,11 @@ interface ManagedRow {
   novncPort: number | undefined
 }
 
-/** List every container the plugin owns (label filter, prefix check). */
+/**
+ * List every container this install owns: managed label, prefix, NAME_PATTERN,
+ * and the ownership token must all hold (audit run-1). Foreign look-alikes are
+ * invisible to sweep/extend/remove on purpose.
+ */
 async function listManaged(options: Options, signal?: AbortSignal): Promise<ManagedRow[]> {
   const { stdout } = await podman(
     options,
@@ -680,46 +782,83 @@ async function listManaged(options: Options, signal?: AbortSignal): Promise<Mana
   let rows: Array<Record<string, unknown>> = []
   try {
     rows = JSON.parse(stdout) as Array<Record<string, unknown>>
+  } catch (parseError) {
+    console.warn(`[podman-sb] podman ps emitted unparseable JSON: ${parseError instanceof Error ? parseError.message : String(parseError)}`)
+    return []
+  }
+  let token: string
+  try {
+    token = installToken(options)
   } catch {
     return []
   }
   return rows
-    .filter((row) => typeof row.Names === 'string' && (row.Names as string).startsWith(PREFIX))
     .map((row) => {
+      const name = normalizePsName(row.Names)
+      if (name === undefined || !name.startsWith(PREFIX) || !NAME_PATTERN.test(name.slice(PREFIX.length))) return null
       const labels = (row.Labels ?? {}) as Record<string, string>
+      if (typeof labels !== 'object' || !ownsRow(labels, token)) return null
       return {
-        name: row.Names as string,
+        name,
         image: String(row.Image ?? ''),
         state: String(row.State ?? ''),
         status: String(row.Status ?? ''),
         labels,
-        createdAt: Number(labels[LABEL.createdAt] ?? 0),
-        expiresAt: Number(labels[LABEL.expiresAt] ?? 0),
+        createdAt: labelNumber(labels[LABEL.createdAt]),
+        expiresAt: labelNumber(labels[LABEL.expiresAt]),
         desktop: labels[LABEL.desktop] === '1',
-        vncPort: labels[LABEL.vncPort] !== undefined ? Number(labels[LABEL.vncPort]) : undefined,
-        novncPort: labels[LABEL.novncPort] !== undefined ? Number(labels[LABEL.novncPort]) : undefined,
+        vncPort: labelNumber(labels[LABEL.vncPort]) !== 0 ? labelNumber(labels[LABEL.vncPort]) : undefined,
+        novncPort: labelNumber(labels[LABEL.novncPort]) !== 0 ? labelNumber(labels[LABEL.novncPort]) : undefined,
       }
     })
+    .filter((row): row is ManagedRow => row !== null)
 }
 
 /** TTL ledger entries surviving crashes; label is the fallback source. */
 interface StateLedger {
-  containers: Record<string, { createdAt: number; expiresAt: number }>
+  containers: Record<string, { createdAt: number; expiresAt: number; memoryMb?: number }>
+}
+
+/** This install's ownership token; stamped on every container we create. */
+function installToken(options: Options): string {
+  const path = join(options.dataDir, 'token')
+  try {
+    const existing = readFileSync(path, 'utf8').trim()
+    if (/^[0-9a-f]{32,}$/u.test(existing)) return existing
+  } catch { /* first use */ }
+  mkdirSync(options.dataDir, { recursive: true })
+  const token = randomBytes(24).toString('hex')
+  writeFileSync(path, token + '\n', { mode: 0o600 })
+  return token
+}
+
+/**
+ * Persist the state ledger: prune stale entries, refuse to follow a
+ * pre-placed symlink, write via temp+rename at mode 0600 (audit run-1).
+ */
+function writeState(options: Options, state: StateLedger): void {
+  mkdirSync(options.dataDir, { recursive: true })
+  const pruned = pruneLedger(state, Date.now())
+  const finalPath = join(options.dataDir, 'state.json')
+  const tempPath = `${finalPath}.tmp-${randomBytes(4).toString('hex')}`
+  const stats = existsSync(finalPath) ? lstatSync(finalPath) : undefined
+  if (stats !== undefined && !stats.isFile()) {
+    throw new PodmanSbError(`state ledger path ${finalPath} is not a regular file`, 'PODMAN_SB_STATE_UNSAFE')
+  }
+  writeFileSync(tempPath, JSON.stringify(pruned, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tempPath, finalPath)
 }
 
 /** Read the state ledger; missing file is an empty ledger. */
 function readState(options: Options): StateLedger {
   try {
-    return JSON.parse(readFileSync(join(options.dataDir, 'state.json'), 'utf8')) as StateLedger
+    const parsed = JSON.parse(readFileSync(join(options.dataDir, 'state.json'), 'utf8')) as StateLedger
+    return parsed !== null && typeof parsed === 'object' && parsed.containers !== null && typeof parsed.containers === 'object'
+      ? parsed
+      : { containers: {} }
   } catch {
     return { containers: {} }
   }
-}
-
-/** Persist the state ledger, creating the dir on first write. */
-function writeState(options: Options, state: StateLedger): void {
-  mkdirSync(options.dataDir, { recursive: true })
-  writeFileSync(join(options.dataDir, 'state.json'), JSON.stringify(state, null, 2))
 }
 
 /** Stop one container's kill timer; absent timers are fine. */
@@ -743,15 +882,29 @@ async function cancelTimer(container: string): Promise<void> {
 async function armTimer(container: string, expiresAt: number, options: Options): Promise<void> {
   const remaining = Math.max(1_000, expiresAt - Date.now())
   const base = timerUnitBase(container)
+  // The unit retries its rm: a busy storage lock at fire time must not end
+  // enforcement (audit run-1).
+  const kill = `i=0; until ${options.containerCLI} rm -tf ${container}; do i=$((i+1)); [ "$i" -ge 5 ] && exit 1; sleep 10; done`
+  const argv = ['--user', '--on-active', String(remaining), '--unit', base, '/bin/sh', '-c', kill]
+  const arm = async (): Promise<void> => {
+    await execFileAsync('systemd-run', argv, { timeout: 10_000 })
+  }
   try {
-    await execFileAsync('systemd-run', [
-      '--user', '--on-active', String(remaining), '--unit', base,
-      options.containerCLI, 'rm', '-tf', container,
-    ], { timeout: 10_000 })
+    await arm()
   } catch (error: unknown) {
-    // Already armed from an earlier sweep: fine, the deadline is unchanged.
-    if (/already (loaded|exists)/iu.test(String((error as { message?: string }).message ?? ''))) return
-    // No user systemd (bare container host, macOS): lazy sweep owns the deadline.
+    const text = String((error as { message?: string }).message ?? '')
+    // A stopped-but-loaded unit or a same-name squatter: tear it down and arm ours.
+    if (/already (loaded|exists)/iu.test(text)) {
+      await cancelTimer(container)
+      await arm()
+      return
+    }
+    // No user systemd (bare container host, macOS, WSL): the sweep fallback
+    // owns the deadline; surface the failure so callers can warn (audit run-1).
+    throw new PodmanSbError(
+      `could not arm kill timer for ${container} (systemd --user unavailable?): ${text}`,
+      'PODMAN_SB_TIMER_UNAVAILABLE',
+    )
   }
 }
 
@@ -764,7 +917,8 @@ async function sweepOnce(options: Options, signal?: AbortSignal): Promise<void> 
   let rows: ManagedRow[]
   try {
     rows = await listManaged(options, signal)
-  } catch {
+  } catch (error: unknown) {
+    console.warn(`[podman-sb] sweep skipped, podman unavailable: ${error instanceof Error ? error.message : String(error)}`)
     return
   }
   const state = readState(options)
@@ -772,13 +926,23 @@ async function sweepOnce(options: Options, signal?: AbortSignal): Promise<void> 
   const now = Date.now()
   for (const row of rows) {
     const ledger = state.containers[row.name]
-    const expiresAt = ledger?.expiresAt ?? row.expiresAt
-    if (expiresAt <= 0) continue
+    // Ledger and label disagree: the earlier deadline wins (audit run-1).
+    const expiresAt = Math.min(
+      ...[ledger?.expiresAt, row.expiresAt].filter((value) => Number.isFinite(value) && value > 0),
+    )
+    if (!Number.isFinite(expiresAt) || expiresAt <= 0) continue
     if (now >= expiresAt) {
       await cancelTimer(row.name)
       try {
         await podman(options, ['rm', '-tf', row.name], signal)
-      } catch { /* already gone */ }
+      } catch (error: unknown) {
+        // Keep the ledger entry unless the container is really gone: a failed
+        // rm must not end enforcement (audit run-1).
+        if (await containerExists(options, row.name, signal)) {
+          console.warn(`[podman-sb] overdue ${row.name} survived rm: ${error instanceof Error ? error.message : String(error)}`)
+          continue
+        }
+      }
       delete state.containers[row.name]
       dirty = true
       continue
@@ -786,7 +950,11 @@ async function sweepOnce(options: Options, signal?: AbortSignal): Promise<void> 
     if (ledger === undefined) {
       state.containers[row.name] = { createdAt: row.createdAt, expiresAt }
       dirty = true
-      await armTimer(row.name, expiresAt, options)
+      try {
+        await armTimer(row.name, expiresAt, options)
+      } catch (armError: unknown) {
+        console.warn(`[podman-sb] ${armError instanceof Error ? armError.message : String(armError)}; periodic sweep owns the deadline`)
+      }
       continue
     }
     // Timer present in the ledger: re-arm only when systemd lost it (reboot).
@@ -797,7 +965,9 @@ async function sweepOnce(options: Options, signal?: AbortSignal): Promise<void> 
       )
       if (stdout.trim() !== 'active') await armTimer(row.name, expiresAt, options)
     } catch {
-      await armTimer(row.name, expiresAt, options)
+      try {
+        await armTimer(row.name, expiresAt, options)
+      } catch { /* systemd absent: periodic sweep owns the deadline */ }
     }
   }
   if (dirty) writeState(options, state)
@@ -834,6 +1004,15 @@ async function ensureImage(options: Options, image: string, signal?: AbortSignal
     await podman(options, ['image', 'inspect', image], signal, 30_000)
     return 'cached'
   } catch { /* not local yet */ }
+  // Free-space watermark before any pull: downloads stay light by refusing to
+  // start when the storage mount is nearly full (audit run-1).
+  const disk = hostSnapshot()
+  if (disk.diskFreeBytes < 5 * 1024 ** 3) {
+    throw new PodmanSbError(
+      `container storage has only ${humanBytes(disk.diskFreeBytes)} free (< 5 GiB floor); prune images before pulling ${image}`,
+      'PODMAN_SB_DISK_FLOOR',
+    )
+  }
   await podman(options, ['pull', image], signal, 600_000)
   return 'pulled'
 }
@@ -946,6 +1125,24 @@ export function apply(ctx: Context, config: Config = {}): void {
       const desktop = spec.desktop === true
       const image = resolveImage(spec.image?.trim() ?? (desktop ? 'debian' : 'alpine'))
       const imageState = await ensureImage(options, image, exec.signal)
+      const owned = await listManaged(options, exec.signal)
+      if (owned.length >= options.maxContainers) {
+        throw new PodmanSbError(
+          `container cap reached (${options.maxContainers}); podman_list + podman_remove free slots first`,
+          'PODMAN_SB_CAP',
+        )
+      }
+      const snapshot0 = hostSnapshot()
+      const limits = clampResources({ cpus: spec.cpus, memoryMb: spec.memory_mb }, snapshot0.cpus, snapshot0.mem.memAvailableBytes)
+      const state0 = readState(options)
+      const committed = committedMemoryMb(state0, new Set(owned.map((row) => row.name)))
+      if (committed + limits.memoryMb > Math.floor(snapshot0.mem.memAvailableBytes / (1024 * 1024)) * 0.8) {
+        throw new PodmanSbError(
+          `memory budget exceeded: ${committed} MB committed + ${limits.memoryMb} MB asked, `
+          + `${Math.floor(snapshot0.mem.memAvailableBytes / (1024 * 1024))} MB available; stop a sandbox or lower memory_mb`,
+          'PODMAN_SB_BUDGET',
+        )
+      }
       const now = Date.now()
       const { expiresAt, ttlMinutes } = clampExpiry(now, spec.ttl_minutes ?? options.defaultTtlMinutes, now)
       let vncHostPort: number | undefined
@@ -966,14 +1163,19 @@ export function apply(ctx: Context, config: Config = {}): void {
       const mounts = [...(spec.mounts ?? [])]
       if (spec.mount_workspace === true) mounts.push(`${cwd}:/workspace`)
       const runArgs = buildRunArgs(
-        { container, image, expiresAt, createdAt: now, desktop, cpus: spec.cpus, memoryMb: spec.memory_mb, env: spec.env, mounts, ports, vncHostPort, novncHostPort },
+        { container, image, expiresAt, createdAt: now, desktop, token: installToken(options), cpus: limits.cpus, memoryMb: limits.memoryMb, env: spec.env, mounts, ports, vncHostPort, novncHostPort },
         home, cwd,
       )
       await podman(options, runArgs, exec.signal, 120_000)
       const state = readState(options)
-      state.containers[container] = { createdAt: now, expiresAt }
+      state.containers[container] = { createdAt: now, expiresAt, memoryMb: limits.memoryMb }
       writeState(options, state)
-      await armTimer(container, expiresAt, options)
+      let timerWarning: string | undefined
+      try {
+        await armTimer(container, expiresAt, options)
+      } catch (armError: unknown) {
+        timerWarning = armError instanceof Error ? armError.message : String(armError)
+      }
       const snapshot = hostSnapshot()
       const lines = [
         `Container ${container} up. Image ${image} (${imageState}).`,
@@ -982,6 +1184,9 @@ export function apply(ctx: Context, config: Config = {}): void {
       if (desktop) {
         lines.push(`VNC: 127.0.0.1:${vncHostPort} (container 5901). noVNC: http://127.0.0.1:${novncHostPort}/vnc.html (container 6081).`)
         lines.push('Desktop next: podman_guide {"recipe": "kde-plasma"} — preferred, dsh-cu drives it.')
+      }
+      if (timerWarning !== undefined) {
+        lines.push(`Warning: kill timer could not be armed (${timerWarning}); the periodic sweep still enforces the ${ttlText(remainingMs(expiresAt, Date.now()))} deadline while DSH runs.`)
       }
       lines.push('Host snapshot before you build:', snapshot.text)
       if (snapshot.mem.memAvailableBytes < 1024 ** 3) {
@@ -1019,7 +1224,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       argv.push(container, 'sh', '-lc', spec.command)
       let stdout = '', stderr = '', exitCode = 0
       try {
-        const done = await execFileAsync(options.containerCLI, argv, { signal, timeout: seconds * 1000, maxBuffer: 16 * 1024 * 1024 })
+        // SIGKILL escalation so a wedged CLI cannot outlive the call (audit run-1).
+        const done = await execFileAsync(options.containerCLI, argv, { signal, timeout: seconds * 1000, maxBuffer: 16 * 1024 * 1024, killSignal: 'SIGKILL' })
         stdout = done.stdout
         stderr = done.stderr
       } catch (error: unknown) {
@@ -1033,11 +1239,11 @@ export function apply(ctx: Context, config: Config = {}): void {
         stderr = failure.stderr ?? ''
       }
       const body = [
-        stdout.length > 0 ? stdout : '(no stdout)',
-        stderr.trim().length > 0 ? `[stderr]\n${stderr.trim()}` : '',
+        stdout.length > 0 ? truncateIo(stdout) : '(no stdout)',
+        stderr.trim().length > 0 ? `[stderr]\n${truncateIo(stderr.trim())}` : '',
         `[exit code: ${exitCode}]`,
       ].filter((part) => part.length > 0).join('\n')
-      return { container, exitCode, stdout, stderr, text: body }
+      return { container, exitCode, stdout: truncateIo(stdout), stderr: truncateIo(stderr), text: body }
     },
   }))
 
@@ -1238,6 +1444,8 @@ export function apply(ctx: Context, config: Config = {}): void {
     async execute(args, exec): Promise<JsonValue> {
       const spec = args as { container: string }
       const container = normalizeContainer(spec.container)
+      const owned = (await listManaged(options, exec.signal)).some((row) => row.name === container)
+      if (!owned) throw new PodmanSbError(`container "${container}" is not a managed sandbox`, 'PODMAN_SB_NOT_MANAGED')
       await cancelTimer(container)
       try {
         await podman(options, ['rm', '-tf', container], exec.signal, 60_000)
@@ -1272,7 +1480,11 @@ export function apply(ctx: Context, config: Config = {}): void {
       state.containers[container] = { createdAt, expiresAt }
       writeState(options, state)
       await cancelTimer(container)
-      await armTimer(container, expiresAt, options)
+      try {
+        await armTimer(container, expiresAt, options)
+      } catch (armError: unknown) {
+        console.warn(`[podman-sb] extend re-arm failed: ${armError instanceof Error ? armError.message : String(armError)}`)
+      }
       const textOut = `${container} now expires in ${ttlText(remainingMs(expiresAt, Date.now()))} `
         + `(${new Date(expiresAt).toISOString()}), total cap ${MAX_TTL_MINUTES}m from creation`
       return { container, expiresAt, ttlMinutes, text: textOut }
@@ -1339,6 +1551,15 @@ export function apply(ctx: Context, config: Config = {}): void {
   sweepOnce(options).catch((error: unknown) => {
     console.warn(`[podman-sb] boot sweep: ${error instanceof Error ? error.message : String(error)}`)
   })
+  // Periodic sweep so the TTL cap never depends on a mutating tool call or an
+  // armed timer alone (audit run-1: silent timer failure + lazy sweep).
+  const sweepInterval = setInterval(() => {
+    sweepOnce(options).catch(() => { /* warned inside sweepOnce */ })
+  }, 60_000)
+  sweepInterval.unref?.()
+  const dispose = () => clearInterval(sweepInterval)
+  const effectful = (ctx as unknown as { effect?: (fn: () => () => void) => unknown }).effect
+  if (typeof effectful === 'function') effectful.call(ctx, () => { dispose(); return dispose })
   // Warm pull keeps the two defaults cached; failures surface on first create.
   if (options.warmPull) {
     for (const entry of Object.values(CATALOG).filter((candidate) => candidate.warm)) {
