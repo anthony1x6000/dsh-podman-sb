@@ -1,0 +1,9 @@
+# Rootless Podman sandbox bundle for DeepSeek Harness.
+# Install: dsh plugin add "github:anthony1x6000/dsh-podman-sb#main"
+# Rows reference the module by package name (Node resolution from the profile).
+# Config knobs (all optional): defaultTtlMinutes, warmPull, containerCLI, dataDir.
+# Env: none. System deps: podman (rootless), tmux inside containers on demand.
+
+- insert:
+    - id: podman-sb
+      name: 'dsh-podman-sb'

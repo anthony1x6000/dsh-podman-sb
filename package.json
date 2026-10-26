@@ -1,0 +1,62 @@
+{
+  "name": "dsh-podman-sb",
+  "version": "0.1.0",
+  "description": "Rootless Podman sandboxes for DeepSeek Harness agents: catalog distros, TTL kill timers, tmux sessions, desktop (KDE) recipes",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "podman",
+    "sandbox",
+    "containers"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/index.js",
+  "types": "./lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/index.d.ts",
+    "cordis.patch.yml",
+    "recipes",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "selfcheck": "node --experimental-strip-types selfcheck.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anthony1x6000/dsh-podman-sb.git"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "packageManager": "pnpm@12.8.1",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@deepseek-ai/dsh-llm": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-util-values": "^0.2.1-rc.2"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@deepseek-ai/dsh-llm": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "^0.2.1-rc.2",
+    "@deepseek-ai/dsh-util-values": "^0.2.1-rc.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
