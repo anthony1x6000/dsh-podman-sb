@@ -96,6 +96,27 @@ export declare function remainingMs(expiresAt: number, now: number): number;
  */
 export declare function ttlText(ms: number): string;
 /**
+ * podman emits `Names` as an array since v4; docker-style output uses a
+ * scalar. Both normalize to one usable name or undefined (audit run-1:
+ * a shape mismatch silently disabled the whole sweep layer).
+ * @param names - the raw `Names` value of a `podman ps --format json` row.
+ * @returns the first name when the shape is usable.
+ */
+export declare function normalizePsName(names: unknown): string | undefined;
+/**
+ * Parse a label number: non-numeric or non-finite values fall back to 0 so
+ * NaN can never slip past a comparison guard (audit run-1).
+ */
+export declare function labelNumber(value: string | undefined): number;
+/**
+ * True when a ps row carries this install's ownership token. The prefix and
+ * the managed label are forgeable by any same-user podman process; the token
+ * file under the plugin data dir is not on that path (audit run-1).
+ */
+export declare function ownsRow(labels: Record<string, string>, token: string): boolean;
+/** Drop ledger entries whose container cannot exist anymore (audit run-1). */
+export declare function pruneLedger(state: StateLedger, now: number): StateLedger;
+/**
  * Systemd unit base for one container's kill timer. `systemd-run --unit`
  * appends `.timer`/`.service`; characters outside systemd's safe set become `-`.
  * @param container - full container name.
@@ -137,6 +158,8 @@ export interface RunSpec {
     expiresAt: number;
     createdAt: number;
     desktop: boolean;
+    /** Install ownership token; foreign containers without it are ignored. */
+    token: string;
     cpus?: number;
     memoryMb?: number;
     env?: Record<string, string>;
@@ -209,9 +232,17 @@ export interface HostSnapshot {
     diskPath: string;
     text: string;
 }
+/** TTL ledger entries surviving crashes; label is the fallback source. */
+interface StateLedger {
+    containers: Record<string, {
+        createdAt: number;
+        expiresAt: number;
+    }>;
+}
 /**
  * Register the podman sandbox tools and the prompt section.
  * @param ctx - plugin context with `ctx.tools` and `ctx.systemPrompt`.
  * @param config - optional defaults from the patch row.
  */
 export declare function apply(ctx: Context, config?: Config): void;
+export {};
