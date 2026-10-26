@@ -206,6 +206,19 @@ assert.strictEqual(mem.swapFreeBytes, 1500000 * 1024)
 assert.strictEqual(humanBytes(1024), '1.0 KiB')
 assert.strictEqual(humanBytes(3 * 1024 ** 3), '3.0 GiB')
 
+
+// ── security: resource caps and output bounds (audit run-1) ─────────────────
+import { clampResources, truncateIo } from './index.ts'
+assert.deepStrictEqual(clampResources({}, 8, 16 * 1024 ** 3), { cpus: 2, memoryMb: 2048 })
+assert.deepStrictEqual(clampResources({ cpus: 64, memoryMb: 999999 }, 4, 4 * 1024 ** 3), { cpus: 4, memoryMb: 2048 })
+assert.deepStrictEqual(clampResources({ cpus: 1, memoryMb: 1024 }, 8, 64 * 1024 ** 3), { cpus: 1, memoryMb: 1024 })
+const small = 'abc'
+assert.strictEqual(truncateIo(small), small)
+const huge = 'x'.repeat(20_000)
+const cut = truncateIo(huge)
+assert.ok(cut.length < 6_000 && cut.includes('…truncated'), 'oversized output is head/tail cut with a marker')
+assert.ok(cut.startsWith('x'.repeat(4096).slice(0, 100)))
+
 // ── recipes: shipped, listed, caveman, and safe ─────────────────────────────
 const mandated = ['kde-plasma', 'node-pnpm', 'flatpak-flathub', 'dev-basics', 'python-uv', 'rust', 'go', 'browsers', 'sshd', 'tmux-sessions']
 const index = recipeIndex()

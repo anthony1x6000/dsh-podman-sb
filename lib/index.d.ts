@@ -38,6 +38,12 @@ export interface Config {
     warmPull?: boolean;
     /** State dir holding the TTL ledger. Default `~/.local/share/dsh-podman-sb`. */
     dataDir?: string;
+    /** Max concurrent managed sandboxes. Default 8 (audit run-1: unbounded creates). */
+    maxContainers?: number;
+    /** Default CPU limit applied when the agent sets none. Default 2. */
+    defaultCpus?: number;
+    /** Default memory limit (MB) applied when the agent sets none. Default 2048. */
+    defaultMemoryMb?: number;
 }
 /** Resolved options the runtime helpers use. */
 export interface Options {
@@ -45,6 +51,9 @@ export interface Options {
     defaultTtlMinutes: number;
     warmPull: boolean;
     dataDir: string;
+    maxContainers: number;
+    defaultCpus: number;
+    defaultMemoryMb: number;
 }
 /** Project config onto fully-defaulted options. */
 export declare function resolveConfig(config?: Config): Options;
@@ -116,6 +125,23 @@ export declare function labelNumber(value: string | undefined): number;
 export declare function ownsRow(labels: Record<string, string>, token: string): boolean;
 /** Drop ledger entries whose container cannot exist anymore (audit run-1). */
 export declare function pruneLedger(state: StateLedger, now: number): StateLedger;
+/**
+ * Deterministic resource ceiling for one container: defaults fill omissions,
+ * host facts bound the ask (audit run-1: unbounded provisioning).
+ * @param request - agent-supplied cpus/memoryMb (optional).
+ * @param hostCpus - host cpu count.
+ * @param memAvailableBytes - host available memory.
+ * @returns the clamped per-container limits.
+ */
+export declare function clampResources(request: {
+    cpus?: number;
+    memoryMb?: number;
+}, hostCpus: number, memAvailableBytes: number): {
+    cpus: number;
+    memoryMb: number;
+};
+/** Head/tail cap for tool-returned command output (audit run-1). */
+export declare function truncateIo(text: string, head?: number, tail?: number): string;
 /**
  * Systemd unit base for one container's kill timer. `systemd-run --unit`
  * appends `.timer`/`.service`; characters outside systemd's safe set become `-`.
@@ -237,6 +263,7 @@ interface StateLedger {
     containers: Record<string, {
         createdAt: number;
         expiresAt: number;
+        memoryMb?: number;
     }>;
 }
 /**
