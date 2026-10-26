@@ -132,6 +132,12 @@ export interface Config {
   warmPull?: boolean
   /** State dir holding the TTL ledger. Default `~/.local/share/dsh-podman-sb`. */
   dataDir?: string
+  /** Max concurrent managed sandboxes. Default 8 (audit run-1: unbounded creates). */
+  maxContainers?: number
+  /** Default CPU limit applied when the agent sets none. Default 2. */
+  defaultCpus?: number
+  /** Default memory limit (MB) applied when the agent sets none. Default 2048. */
+  defaultMemoryMb?: number
 }
 
 /** Resolved options the runtime helpers use. */
@@ -140,6 +146,9 @@ export interface Options {
   defaultTtlMinutes: number
   warmPull: boolean
   dataDir: string
+  maxContainers: number
+  defaultCpus: number
+  defaultMemoryMb: number
 }
 
 /** Project config onto fully-defaulted options. */
@@ -152,6 +161,9 @@ export function resolveConfig(config: Config = {}): Options {
       : DEFAULT_TTL_MINUTES,
     warmPull: config.warmPull ?? true,
     dataDir: config.dataDir ?? join(homedir(), '.local/share/dsh-podman-sb'),
+    maxContainers: Math.max(1, Math.floor(config.maxContainers ?? 8)),
+    defaultCpus: Math.max(1, config.defaultCpus ?? 2),
+    defaultMemoryMb: Math.max(256, Math.floor(config.defaultMemoryMb ?? 2048)),
   }
 }
 
@@ -313,6 +325,44 @@ export function pruneLedger(state: StateLedger, now: number): StateLedger {
     containers[name] = entry
   }
   return { containers }
+}
+
+/** Sum of memory the install's live sandboxes claim (ledger source of truth). */
+function committedMemoryMb(state: StateLedger, liveNames: ReadonlySet<string>): number {
+  let total = 0
+  for (const [name, entry] of Object.entries(state.containers)) {
+    if (liveNames.has(name) && Number.isFinite(entry.memoryMb)) total += entry.memoryMb ?? 0
+  }
+  return total
+}
+
+/**
+ * Deterministic resource ceiling for one container: defaults fill omissions,
+ * host facts bound the ask (audit run-1: unbounded provisioning).
+ * @param request - agent-supplied cpus/memoryMb (optional).
+ * @param hostCpus - host cpu count.
+ * @param memAvailableBytes - host available memory.
+ * @returns the clamped per-container limits.
+ */
+export function clampResources(
+  request: { cpus?: number; memoryMb?: number },
+  hostCpus: number,
+  memAvailableBytes: number,
+): { cpus: number; memoryMb: number } {
+  const MiB = 1024 * 1024
+  const maxMemoryMb = Math.max(256, Math.floor(Math.min(8192 * MiB, memAvailableBytes / 2) / MiB))
+  const cpus = Math.min(
+    Math.max(1, Math.floor(request.cpus ?? 2)),
+    Math.max(1, Math.floor(hostCpus)),
+  )
+  const memoryMb = Math.min(Math.max(256, Math.floor(request.memoryMb ?? 2048)), maxMemoryMb)
+  return { cpus, memoryMb }
+}
+
+/** Head/tail cap for tool-returned command output (audit run-1). */
+export function truncateIo(text: string, head = 4096, tail = 1024): string {
+  if (text.length <= head + tail + 64) return text
+  return `${text.slice(0, head)}\n…truncated ${text.length - head - tail} bytes…\n${text.slice(text.length - tail)}`
 }
 
 /**
@@ -766,7 +816,7 @@ async function listManaged(options: Options, signal?: AbortSignal): Promise<Mana
 
 /** TTL ledger entries surviving crashes; label is the fallback source. */
 interface StateLedger {
-  containers: Record<string, { createdAt: number; expiresAt: number }>
+  containers: Record<string, { createdAt: number; expiresAt: number; memoryMb?: number }>
 }
 
 /** This install's ownership token; stamped on every container we create. */
@@ -954,6 +1004,15 @@ async function ensureImage(options: Options, image: string, signal?: AbortSignal
     await podman(options, ['image', 'inspect', image], signal, 30_000)
     return 'cached'
   } catch { /* not local yet */ }
+  // Free-space watermark before any pull: downloads stay light by refusing to
+  // start when the storage mount is nearly full (audit run-1).
+  const disk = hostSnapshot()
+  if (disk.diskFreeBytes < 5 * 1024 ** 3) {
+    throw new PodmanSbError(
+      `container storage has only ${humanBytes(disk.diskFreeBytes)} free (< 5 GiB floor); prune images before pulling ${image}`,
+      'PODMAN_SB_DISK_FLOOR',
+    )
+  }
   await podman(options, ['pull', image], signal, 600_000)
   return 'pulled'
 }
@@ -1066,6 +1125,24 @@ export function apply(ctx: Context, config: Config = {}): void {
       const desktop = spec.desktop === true
       const image = resolveImage(spec.image?.trim() ?? (desktop ? 'debian' : 'alpine'))
       const imageState = await ensureImage(options, image, exec.signal)
+      const owned = await listManaged(options, exec.signal)
+      if (owned.length >= options.maxContainers) {
+        throw new PodmanSbError(
+          `container cap reached (${options.maxContainers}); podman_list + podman_remove free slots first`,
+          'PODMAN_SB_CAP',
+        )
+      }
+      const snapshot0 = hostSnapshot()
+      const limits = clampResources({ cpus: spec.cpus, memoryMb: spec.memory_mb }, snapshot0.cpus, snapshot0.mem.memAvailableBytes)
+      const state0 = readState(options)
+      const committed = committedMemoryMb(state0, new Set(owned.map((row) => row.name)))
+      if (committed + limits.memoryMb > Math.floor(snapshot0.mem.memAvailableBytes / (1024 * 1024)) * 0.8) {
+        throw new PodmanSbError(
+          `memory budget exceeded: ${committed} MB committed + ${limits.memoryMb} MB asked, `
+          + `${Math.floor(snapshot0.mem.memAvailableBytes / (1024 * 1024))} MB available; stop a sandbox or lower memory_mb`,
+          'PODMAN_SB_BUDGET',
+        )
+      }
       const now = Date.now()
       const { expiresAt, ttlMinutes } = clampExpiry(now, spec.ttl_minutes ?? options.defaultTtlMinutes, now)
       let vncHostPort: number | undefined
@@ -1086,12 +1163,12 @@ export function apply(ctx: Context, config: Config = {}): void {
       const mounts = [...(spec.mounts ?? [])]
       if (spec.mount_workspace === true) mounts.push(`${cwd}:/workspace`)
       const runArgs = buildRunArgs(
-        { container, image, expiresAt, createdAt: now, desktop, token: installToken(options), cpus: spec.cpus, memoryMb: spec.memory_mb, env: spec.env, mounts, ports, vncHostPort, novncHostPort },
+        { container, image, expiresAt, createdAt: now, desktop, token: installToken(options), cpus: limits.cpus, memoryMb: limits.memoryMb, env: spec.env, mounts, ports, vncHostPort, novncHostPort },
         home, cwd,
       )
       await podman(options, runArgs, exec.signal, 120_000)
       const state = readState(options)
-      state.containers[container] = { createdAt: now, expiresAt }
+      state.containers[container] = { createdAt: now, expiresAt, memoryMb: limits.memoryMb }
       writeState(options, state)
       let timerWarning: string | undefined
       try {
@@ -1147,7 +1224,8 @@ export function apply(ctx: Context, config: Config = {}): void {
       argv.push(container, 'sh', '-lc', spec.command)
       let stdout = '', stderr = '', exitCode = 0
       try {
-        const done = await execFileAsync(options.containerCLI, argv, { signal, timeout: seconds * 1000, maxBuffer: 16 * 1024 * 1024 })
+        // SIGKILL escalation so a wedged CLI cannot outlive the call (audit run-1).
+        const done = await execFileAsync(options.containerCLI, argv, { signal, timeout: seconds * 1000, maxBuffer: 16 * 1024 * 1024, killSignal: 'SIGKILL' })
         stdout = done.stdout
         stderr = done.stderr
       } catch (error: unknown) {
@@ -1161,11 +1239,11 @@ export function apply(ctx: Context, config: Config = {}): void {
         stderr = failure.stderr ?? ''
       }
       const body = [
-        stdout.length > 0 ? stdout : '(no stdout)',
-        stderr.trim().length > 0 ? `[stderr]\n${stderr.trim()}` : '',
+        stdout.length > 0 ? truncateIo(stdout) : '(no stdout)',
+        stderr.trim().length > 0 ? `[stderr]\n${truncateIo(stderr.trim())}` : '',
         `[exit code: ${exitCode}]`,
       ].filter((part) => part.length > 0).join('\n')
-      return { container, exitCode, stdout, stderr, text: body }
+      return { container, exitCode, stdout: truncateIo(stdout), stderr: truncateIo(stderr), text: body }
     },
   }))
 
