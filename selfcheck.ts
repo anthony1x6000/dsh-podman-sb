@@ -255,6 +255,8 @@ assert(patch.includes(`name: '${manifest.name}'`), 'bundle layer must reference 
 assert(!patch.includes('./index.ts'), 'bundle layer must not reference source paths')
 for (const dep of ['@deepseek-ai/dsh-tools', '@deepseek-ai/cordis', '@deepseek-ai/dsh-util-values']) {
   assert.ok(manifest.dependencies[dep], `runtime import ${dep} must be a dependency`)
+  assert.ok(!/[~^]/u.test(manifest.dependencies[dep]), `dependency ${dep} must be exact-pinned (no drift for git installs)`)
+  assert.ok((manifest.peerDependencies ?? {})[dep], `peer declaration ${dep} engages the dsh compatibility gate`)
 }
 
 // ── the committed build artifact is what profiles load ──────────────────────

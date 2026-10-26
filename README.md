@@ -27,20 +27,33 @@ files, and read host resources before provisioning anything heavy.
 ## Lifecycle
 
 Every container gets a TTL label, a state-ledger entry, and a transient
-`systemd --user` kill timer (`systemd-run --on-active` → `podman rm -tf`), so
-expiry survives a DSH crash — the boot sweep and every mutating tool call
-re-arm lost timers and remove overdue containers. Default 30 minutes, hard cap
-24 hours from creation. `podman_extend` re-arms the timer but never pushes
-total life past the cap.
+`systemd --user` kill timer (`systemd-run --on-active` → `podman rm -tf`,
+retried), so expiry survives a DSH crash — the boot sweep, a 60-second
+periodic sweep, and every mutating tool call re-arm lost timers and remove
+overdue containers. Default 30 minutes, hard cap 24 hours from creation.
+`podman_extend` re-arms the timer but never pushes total life past the cap.
+Known clock caveat: the timer is monotonic (immune to clock steps, paused
+over host suspend), while the sweep checks wall-clock time — a large backward
+clock step delays the sweep's backstop by the same delta. Treat host suspend
+as pause-of-life for the cap.
 
 ## Safety model
 
 Rootless-safe by construction — there is no escape hatch to find:
 
 - No `--privileged`, no host docker socket, ever (asserted in `selfcheck.ts`).
-- Published ports are loopback-only (`127.0.0.1`), even when the agent asks otherwise.
-- Host mounts must resolve under `$HOME` or the session workspace.
-- Only containers named `dsh-sb-*` with the plugin label are touched.
+- Published ports are loopback-only (`127.0.0.1`), even when the agent asks
+  otherwise. Loopback is host-wide, not per-user: on multi-user hosts give
+  desktop containers a long random VNC password (the recipe does).
+- Host mounts must REALPATH under `$HOME` or the session workspace: symlinks
+  are followed before approval and any target outside the roots — or inside a
+  credential subtree (`~/.ssh`, `~/.gnupg`, `~/.config/gh`, `~/.aws`,
+  `~/.kube`, `~/.docker`, `~/.config/podman`) — is refused.
+- Only containers named `dsh-sb-*` carrying this install's ownership token
+  are touched; prefix look-alikes with forged labels are invisible.
+- Provisioning is capped: a container count limit, a host memory budget, and
+  always-on per-container cpu/memory limits (see Config). Pulls refuse to
+  start under a 5 GiB storage free-space floor.
 
 ## Go-to catalog
 
@@ -66,12 +79,17 @@ sudo apt update && sudo apt install -y podman
 
 Into your profile (pnpm only — no profile hand-editing):
 
+Pin a tag or commit for anything long-lived — `#main` re-resolves on every
+update and nothing checks CI status at install time:
+
 ```sh
-dsh plugin add "github:anthony1x6000/dsh-podman-sb#main"
+dsh plugin add "github:anthony1x6000/dsh-podman-sb#v0.1.0"
 ```
 
 Then restart `dsh web` for the new bundle layer to take effect. Build
-artifacts (`lib/`) are committed, so installing from git runs no build.
+artifacts (`lib/`) are committed, so installing from git runs no build; CI
+rebuilds `lib/` from source (config-independently) and diffs it on every push
+and PR.
 
 Local development: `pnpm install && pnpm build`, then
 `dsh plugin add "link:$(pwd)"`.
@@ -86,6 +104,9 @@ Patch-row `config:` values (all optional):
 | `warmPull` | `true` | Warm-pull the two default catalog images at boot |
 | `containerCLI` | `podman` | Container CLI binary |
 | `dataDir` | `~/.local/share/dsh-podman-sb` | TTL state ledger directory |
+| `maxContainers` | `8` | Max concurrent managed sandboxes |
+| `defaultCpus` | `2` | Per-container CPU limit when the agent sets none |
+| `defaultMemoryMb` | `2048` | Per-container memory limit (MB) when the agent sets none |
 
 ## Checks
 

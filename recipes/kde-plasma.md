@@ -22,10 +22,10 @@ Make desktop user. VNC as root is pain, do not:
 podman_exec {"container": "desk", "command": "useradd -m -s /bin/bash agent && echo 'agent:agent' | chpasswd"}
 ```
 
-Set VNC password for that user:
+Set VNC password for that user. Make it random, write it down somewhere safe, never reuse across box:
 
 ```
-podman_exec {"container": "desk", "command": "su - agent -c 'mkdir -p ~/.vnc && echo agent | vncpasswd -f > ~/.vnc/passwd && chmod 600 ~/.vnc/passwd'"}
+podman_exec {"container": "desk", "command": "VNC_PW=$(head -c 6 /dev/urandom | base64) && echo $VNC_PW && su - agent -c \"mkdir -p ~/.vnc && printf '%s\\n' '$VNC_PW' | vncpasswd -f > ~/.vnc/passwd && chmod 600 ~/.vnc/passwd\""}
 ```
 
 Point VNC at Plasma session:
@@ -46,7 +46,9 @@ Start noVNC web gateway on port 6081 in container:
 podman_exec {"container": "desk", "command": "websockify --web /usr/share/novnc 6081 localhost:5901 &> /tmp/novnc.log & sleep 1 && curl -s -o /dev/null -w \"%{http_code}\" http://localhost:6081/vnc.html"}
 ```
 
-`200` mean up. Browser on host: `http://127.0.0.1:<novnc-host-port>/vnc.html`. Password `agent`.
+`200` mean up. Browser on host: `http://127.0.0.1:<novnc-host-port>/vnc.html`. Password: the random one you generated above.
+
+Note: loopback port is host-wide. Any process on host, any user, can reach it. Random password is the gate — keep it long, keep it per-box.
 
 dsh-cu: point it at that noVNC URL, or bare VNC `127.0.0.1:<vnc-host-port>`, password `agent`.
 
