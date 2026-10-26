@@ -16,8 +16,12 @@ import {
   humanBytes,
   inject,
   loadRecipe,
+  labelNumber,
   name,
+  normalizePsName,
+  ownsRow,
   parseContainerSpec,
+  pruneLedger,
   parseMeminfo,
   portSpec,
   recipeIndex,
@@ -150,8 +154,36 @@ assert.strictEqual(parseContainerSpec('box:relative'), null)
 assert.strictEqual(parseContainerSpec('-box:/x'), null)
 assert.strictEqual(parseContainerSpec('box:'), null)
 
+
+// ── security: TTL enforcement and ownership (audit run-1) ───────────────────
+// podman ps Names shape: podman >=4 emits an array, docker-style emits a string
+assert.strictEqual(normalizePsName('dsh-sb-box'), 'dsh-sb-box')
+assert.strictEqual(normalizePsName(['dsh-sb-box', 'other']), 'dsh-sb-box')
+assert.strictEqual(normalizePsName([]), undefined)
+assert.strictEqual(normalizePsName(undefined), undefined)
+assert.strictEqual(normalizePsName({ weird: true }), undefined)
+// label numbers are finite or fall back to 0 (NaN can no longer sneak past guards)
+assert.strictEqual(labelNumber('12345'), 12345)
+assert.strictEqual(labelNumber('junk'), 0)
+assert.strictEqual(labelNumber(undefined), 0)
+// ownership requires the plugin token; forged labels alone are not enough
+assert.strictEqual(ownsRow({ 'dsh-podman-sb.managed': '1', 'dsh-podman-sb.token': 'tok' }, 'tok'), true)
+assert.strictEqual(ownsRow({ 'dsh-podman-sb.managed': '1', 'dsh-podman-sb.token': 'tok' }, 'other'), false)
+assert.strictEqual(ownsRow({ 'dsh-podman-sb.managed': '1' }, 'tok'), false)
+assert.strictEqual(ownsRow({}, 'tok'), false)
+// ledger GC: entries past creation + cap + grace go, live ones stay
+const gcNow = 10_000_000_000_000
+const kept = pruneLedger({ containers: {
+  live: { createdAt: gcNow - 60_000, expiresAt: gcNow + 60_000 },
+  stale: { createdAt: gcNow - MAX_TTL_MINUTES * 60_000 - 7_200_000, expiresAt: gcNow - 60_000 },
+} }, gcNow)
+assert.deepStrictEqual(Object.keys(kept.containers).sort(), ['live'])
+// timer units carry a name hash: deterministic, injective, collision-free
+assert.strictEqual(timerUnitBase('dsh-sb-box'), timerUnitBase('dsh-sb-box'))
+assert.notStrictEqual(timerUnitBase('dsh-sb-box'), timerUnitBase('dsh-sb-box2'))
+assert.ok(/^dsh-sb-kill-[A-Za-z0-9_.:-]+-[0-9a-f]{8}$/.test(timerUnitBase('dsh-sb-box')), timerUnitBase('dsh-sb-box'))
+
 // ── systemd kill-timer unit names stay valid ────────────────────────────────
-assert.strictEqual(timerUnitBase('dsh-sb-box'), 'dsh-sb-kill-dsh-sb-box')
 for (const container of ['dsh-sb-box', 'dsh-sb-a b', 'dsh-sb-x'.repeat(80), 'dsh-sb-ümlaut']) {
   assert(
     /^dsh-sb-kill-[A-Za-z0-9_.:-]+$/u.test(timerUnitBase(container)),
@@ -216,8 +248,9 @@ for (const dep of ['@deepseek-ai/dsh-tools', '@deepseek-ai/cordis', '@deepseek-a
 const built = await import('./lib/index.js') as typeof import('./index.ts')
 assert.strictEqual(built.name, name, 'built artifact must export the plugin name')
 assert.strictEqual(typeof built.apply, 'function', 'built artifact must export apply')
-assert.strictEqual(built.timerUnitBase('dsh-sb-box'), 'dsh-sb-kill-dsh-sb-box')
 assert.strictEqual(built.humanBytes(2048), '2.0 KiB')
+assert.strictEqual(built.timerUnitBase('dsh-sb-box'), timerUnitBase('dsh-sb-box'))
+assert.strictEqual(built.normalizePsName(['dsh-sb-box']), 'dsh-sb-box')
 assert.strictEqual(built.resolveImage('alpine'), CATALOG.alpine.image)
 rmSync(fixture, { recursive: true, force: true })
 console.log('podman-sb selfcheck: ok')
