@@ -102,15 +102,6 @@ export declare function ttlText(ms: number): string;
  * @returns unit base like `dsh-sb-kill-dsh-sb-box`.
  */
 export declare function timerUnitBase(container: string): string;
-/**
- * Approve one host mount for a rootless container: it must resolve under
- * $HOME or the session workspace. `/etc`, `/var`, other users' trees, and
- * the docker socket all return null.
- * @param hostPath - the host side of a `HOST:CTR` mount spec.
- * @param home - the current user's home.
- * @param cwd - the current workspace root.
- * @returns the resolved absolute path, or null when rejected.
- */
 export declare function safeMount(hostPath: string, home: string, cwd: string): string | null;
 /**
  * Loopback-only publish spec: desktop containers never expose a LAN port.
@@ -127,6 +118,18 @@ export declare function portSpec(hostPort: number, containerPort: number): strin
  * @returns the loopback publish spec, or null when unparseable.
  */
 export declare function normalizePublish(spec: string, fallbackHostPort: number): string | null;
+/**
+ * Parse and confine a CONTAINER:/path spec (podman_cp). The embedded name runs
+ * through the same prefix rule as every other tool; foreign containers are
+ * rejected (audit run-1).
+ * @param spec - `box:/tmp/x` or `dsh-sb-box:/tmp/x`.
+ * @returns the normalized `{ name, path }`, or null when the spec is foreign
+ * or malformed.
+ */
+export declare function parseContainerSpec(spec: string): {
+    name: string;
+    path: string;
+} | null;
 /** Run arguments the plugin may set — the full, validated shape. */
 export interface RunSpec {
     container: string;

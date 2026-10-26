@@ -2,6 +2,7 @@
 // packaging rules break. Run: `node --experimental-strip-types selfcheck.ts`.
 import assert from 'node:assert'
 import { readdirSync, readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import {
   CATALOG,
@@ -16,6 +17,7 @@ import {
   inject,
   loadRecipe,
   name,
+  parseContainerSpec,
   parseMeminfo,
   portSpec,
   recipeIndex,
@@ -78,12 +80,26 @@ assert.strictEqual(ttlText(90_000), '1m')
 assert.ok(ttlText(23 * 60 * 60 * 1000).includes('23h'))
 
 // ── rootless-safe rules ─────────────────────────────────────────────────────
-const home = '/home/virt', cwd = '/home/virt/Projects/dsh-podman-sb'
-assert.strictEqual(safeMount('/home/virt/data', home, cwd), '/home/virt/data')
-assert.strictEqual(safeMount(`${cwd}/tmp`, home, cwd), `${cwd}/tmp`)
-assert.strictEqual(safeMount('/etc/passwd', home, cwd), null)
-assert.strictEqual(safeMount('/var/run/docker.sock', home, cwd), null)
-assert.strictEqual(safeMount('/home/other/secret', home, cwd), null)
+// safeMount is realpath-based: fixtures must exist on disk (audit run-1).
+import { mkdtempSync, rmSync, symlinkSync, mkdirSync } from 'node:fs'
+const home = homedir() // realpath-backed safeMount needs a real root
+const cwd = process.cwd()
+const fixture = mkdtempSync(join(import.meta.dirname, '.selfcheck-tmp-'))
+mkdirSync(join(fixture, 'data'))
+  symlinkSync('/etc', join(fixture, 'etc-link'))
+  symlinkSync(join(fixture, 'missing'), join(fixture, 'dangling'))
+  assert.strictEqual(safeMount(join(fixture, 'data'), home, fixture), join(fixture, 'data'))
+  assert.strictEqual(safeMount(join(fixture, 'etc-link'), home, fixture), null, 'symlink escaping the roots is rejected')
+  assert.strictEqual(safeMount(join(fixture, 'dangling'), home, fixture), null, 'dangling symlink is rejected')
+  assert.strictEqual(safeMount(join(fixture, 'etc-link/passwd'), home, fixture), null)
+assert.strictEqual(safeMount('/etc/passwd', home, fixture), null)
+assert.strictEqual(safeMount('/var/run/docker.sock', home, fixture), null)
+assert.strictEqual(safeMount('/home/other/secret', home, fixture), null)
+assert.strictEqual(safeMount(home, home, fixture), null, 'the home root itself is not mountable')
+assert.strictEqual(safeMount(join(home, '.ssh'), home, fixture), null, 'credential subtrees are denied')
+assert.strictEqual(safeMount(join(home, '.config/gh/hosts.yml'), home, fixture), null)
+assert.strictEqual(safeMount(join(home, '.gnupg'), home, fixture), null)
+assert.strictEqual(safeMount('/srv/data', home, '/srv'), null, 'cwd root outside $HOME is not allowed')
 
 assert.strictEqual(portSpec(5901, 5901), '127.0.0.1:5901:5901')
 
@@ -97,17 +113,42 @@ const base = buildRunArgs({
   cpus: 2,
   memoryMb: 2048,
   env: { FOO: 'bar' },
-  mounts: ['/home/virt/data:/data'],
+  mounts: [`${join(fixture, 'data')}:/data`],
   ports: [portSpec(5901, 5901)],
 }, home, cwd)
 assert.ok(base.includes('--name'), 'run args name the container')
 assert.ok(base.includes(`--label=${LABEL_MANAGED}=1`), 'run args mark ownership')
 assert.ok(base.includes('--cpus=2') && base.includes('--memory=2048m'))
 assert.ok(base.includes('--env=FOO=bar'))
-assert.ok(base.includes('--volume=/home/virt/data:/data'))
+assert.ok(base.includes(`--volume=${join(fixture, 'data')}:/data`))
 assert.ok(base.includes('--publish=127.0.0.1:5901:5901'))
 assert.ok(!base.includes('--privileged'), 'never privileged')
 assert.ok(!base.some((a) => a.includes('docker.sock')), 'never the host docker socket')
+
+
+
+// mount specs: container side is a plain absolute path; only ':ro' may follow
+assert.throws(() => buildRunArgs({ container: 'dsh-sb-box', image: CATALOG.alpine.image, expiresAt: now + 30 * 60_000, createdAt: now, desktop: false, mounts: [`${join(fixture, 'data')}:/data:U`] }, home, cwd))
+assert.throws(() => buildRunArgs({ container: 'dsh-sb-box', image: CATALOG.alpine.image, expiresAt: now + 30 * 60_000, createdAt: now, desktop: false, mounts: [`${join(fixture, 'data')}:relative`] }, home, cwd))
+const roMount = buildRunArgs({ container: 'dsh-sb-box', image: CATALOG.alpine.image, expiresAt: now + 30 * 60_000, createdAt: now, desktop: false, mounts: [`${join(fixture, 'data')}:/data:ro`] }, home, cwd)
+assert.ok(roMount.includes(`--volume=${join(fixture, 'data')}:/data:ro`))
+
+// image refs: never flag-shaped
+assert.throws(() => resolveImage('-secret/x:y'))
+assert.throws(() => resolveImage('--volume=/etc:/etc'))
+assert.ok(resolveImage('ghcr.io/a/b:c1').length > 0)
+// the image operand is guarded by '--' in the run argv
+const guarded = buildRunArgs({ container: 'dsh-sb-box', image: CATALOG.alpine.image, expiresAt: now + 30 * 60_000, createdAt: now, desktop: false }, home, cwd)
+assert.strictEqual(guarded[guarded.indexOf('--') + 1], CATALOG.alpine.image)
+
+// cp specs: the embedded container name is normalized and must match
+assert.deepStrictEqual(parseContainerSpec('box:/tmp/x'), { name: 'dsh-sb-box', path: '/tmp/x' })
+assert.deepStrictEqual(parseContainerSpec('dsh-sb-box:/tmp/x'), { name: 'dsh-sb-box', path: '/tmp/x' })
+// foreign names are prefix-normalized: the rebuilt argv can only ever address the dsh-sb-* namespace
+assert.deepStrictEqual(parseContainerSpec('prod-db:/etc/secrets'), { name: 'dsh-sb-prod-db', path: '/etc/secrets' })
+assert.strictEqual(parseContainerSpec('box:relative'), null)
+assert.strictEqual(parseContainerSpec('-box:/x'), null)
+assert.strictEqual(parseContainerSpec('box:'), null)
 
 // ── systemd kill-timer unit names stay valid ────────────────────────────────
 assert.strictEqual(timerUnitBase('dsh-sb-box'), 'dsh-sb-kill-dsh-sb-box')
@@ -178,4 +219,5 @@ assert.strictEqual(typeof built.apply, 'function', 'built artifact must export a
 assert.strictEqual(built.timerUnitBase('dsh-sb-box'), 'dsh-sb-kill-dsh-sb-box')
 assert.strictEqual(built.humanBytes(2048), '2.0 KiB')
 assert.strictEqual(built.resolveImage('alpine'), CATALOG.alpine.image)
+rmSync(fixture, { recursive: true, force: true })
 console.log('podman-sb selfcheck: ok')
