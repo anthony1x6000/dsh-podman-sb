@@ -259,6 +259,14 @@ for (const dep of ['@deepseek-ai/dsh-tools', '@deepseek-ai/cordis', '@deepseek-a
   assert.ok((manifest.peerDependencies ?? {})[dep], `peer declaration ${dep} engages the dsh compatibility gate`)
 }
 
+// ── README opens with the install one-liner ─────────────────────────────────
+const readmeFirstLine = readFileSync(join(import.meta.dirname, 'README.md'), 'utf8').split('\n', 1)[0]
+assert.strictEqual(
+  readmeFirstLine,
+  'dsh plugin add "github:anthony1x6000/dsh-podman-sb#main"',
+  'README line 1 must be the install one-liner',
+)
+
 // ── the committed build artifact is what profiles load ──────────────────────
 const built = await import('./lib/index.js') as typeof import('./index.ts')
 assert.strictEqual(built.name, name, 'built artifact must export the plugin name')
