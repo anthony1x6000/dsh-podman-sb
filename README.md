@@ -1,3 +1,5 @@
+dsh plugin add "github:anthony1x6000/dsh-podman-sb#main"
+
 # dsh-podman-sb
 
 CI: [actions/workflows/ci.yml](https://github.com/anthony1x6000/dsh-podman-sb/actions/workflows/ci.yml)
@@ -79,12 +81,12 @@ sudo apt update && sudo apt install -y podman
 
 Into your profile (pnpm only — no profile hand-editing):
 
-Pin a tag or commit for anything long-lived — `#main` re-resolves on every
-update and nothing checks CI status at install time:
-
 ```sh
-dsh plugin add "github:anthony1x6000/dsh-podman-sb#v0.1.0"
+dsh plugin add "github:anthony1x6000/dsh-podman-sb#main"
 ```
+
+`#main` follows the branch tip, so updates re-resolve and nothing checks CI
+status at install time. Pin a commit instead for a long-lived install.
 
 Then restart `dsh web` for the new bundle layer to take effect. Build
 artifacts (`lib/`) are committed, so installing from git runs no build; CI
